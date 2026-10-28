@@ -181,9 +181,14 @@ impl State {
             sg += n;
         }
         let rs = d.compute_pgm_rsrc2.0;
-        if sg != ((rs >> 1) & 31) as usize {
+        // gfx11 kernels declare more user SGPRs than they enable (padding between the last enabled user register and the
+        // workgroup ids, left 0: LLVM's FeatureUserSGPRInit16Bug padding on gfx1100); the ids follow the DECLARED count.
+        // gfx1201 ids are in ttmps.
+        let declared = ((rs >> 1) & 31) as usize;
+        if sg > declared || (sg != declared && arch == Arch::Gfx1201) {
             return Err("descriptor user SGPR count disagrees with enabled properties".into());
         }
+        sg = declared;
         if arch == Arch::Gfx1201 {
             st.t[9] = launch.workgroup[0];
             st.t[7] = if rs & (1 << 8) != 0 {
