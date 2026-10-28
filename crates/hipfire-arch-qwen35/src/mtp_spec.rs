@@ -3376,6 +3376,26 @@ fn mtp_prompt_fill_scratch_rows(prompt_len: usize, prefill_max_batch: usize) -> 
     }
 }
 
+/// Rows of trunk hidden the MTP prompt fill holds at once, which is the
+/// longest outer chunk the fill loop takes: `trunk_chunk_max` on the AR route
+/// and `head_rows` on the own route, never more than the prompt. The pairing
+/// buffer adds one partner row on top of this. Sized by the chunk, not the
+/// prompt, so it does not grow with the prompt (168 MiB at 8,192 rows on a
+/// 5,120-wide model; a whole-prompt buffer costs `n_embd * 4` bytes per prompt
+/// token, 2.4 GiB at 120K tokens).
+fn mtp_prompt_hidden_chunk_rows(
+    route: MtpPromptRoute,
+    head_rows: usize,
+    trunk_chunk_max: usize,
+    prompt_len: usize,
+) -> usize {
+    let ceiling = match route {
+        MtpPromptRoute::Own => head_rows,
+        MtpPromptRoute::ArRoute => trunk_chunk_max,
+    };
+    ceiling.max(1).min(prompt_len.max(1))
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn prefill_trunk_and_mtp_cache(
     gpu: &mut Gpu,
@@ -3546,10 +3566,17 @@ where
         legacy_rotation_k
     };
     // The head pairs token `p` with the trunk hidden of position `p - 1`, as
-    // decode does. Row 0 holds the partner of the first fill token; row
-    // `j + 1` holds the hidden of position `start_pos + j`. Fill row `j`
-    // therefore pairs `prompt_tokens[j]` with row `j`.
-    let prompt_hidden = gpu.alloc_tensor(&[(prompt_tokens.len() + 1) * dim], DType::F32)?;
+    // decode does. The buffer covers one outer chunk, not the prompt: for the
+    // chunk starting at prompt offset `off`, row 0 holds the partner of its
+    // first fill token (the previous chunk's last hidden, carried over below)
+    // and row `j + 1` holds the hidden of position `start_pos + off + j`.
+    // Fill row `j` of the chunk therefore pairs `prompt_tokens[off + j]` with
+    // row `j`. A whole-prompt buffer cost `dim * 4` bytes per prompt token
+    // (2.4 GiB at 120K tokens on the 27B) on top of the KV cache and made a
+    // cold long prompt run out of memory in this allocation.
+    let hidden_chunk_rows =
+        mtp_prompt_hidden_chunk_rows(route, head_rows, trunk_chunk_max, prompt_tokens.len());
+    let prompt_hidden = gpu.alloc_tensor(&[(hidden_chunk_rows + 1) * dim], DType::F32)?;
     let mut mtp_prefill_scratch = if use_batched_mtp_fill {
         let created = if fill_fast_wide {
             Qwen35MtpHeadBatchedScratch::new_for_prompt_fill(gpu, &head.config, head_rows)
@@ -3615,8 +3642,9 @@ where
             let chunk_start_pos = start_pos + off;
             let committed_pos = start_pos + end;
 
-            // Per-chunk hidden destination: rows `off + 1..` of the pairing buffer.
-            let chunk_hidden = prompt_hidden.sub_offset((off + 1) * dim, chunk.len() * dim);
+            // Per-chunk hidden destination: rows `1..=chunk.len()` of the pairing
+            // buffer (row 0 is the carried partner of the chunk's first token).
+            let chunk_hidden = prompt_hidden.sub_offset(dim, chunk.len() * dim);
 
             let t_trunk = Instant::now();
             match route {
@@ -3658,7 +3686,8 @@ where
                 while slice_off < end {
                     let slice_end = ((slice_off / head_rows + 1) * head_rows).min(end);
                     let slice = &prompt_tokens[slice_off..slice_end];
-                    let slice_hidden = prompt_hidden.sub_offset(slice_off * dim, slice.len() * dim);
+                    let slice_hidden =
+                        prompt_hidden.sub_offset((slice_off - off) * dim, slice.len() * dim);
                     let positions: Vec<i32> = (start_pos + slice_off..start_pos + slice_end)
                         .map(|position| position as i32)
                         .collect();
@@ -3679,7 +3708,7 @@ where
                 }
             } else {
                 for (i, &token) in chunk.iter().enumerate() {
-                    let hidden_row = prompt_hidden.sub_offset((off + i) * dim, dim);
+                    let hidden_row = prompt_hidden.sub_offset(i * dim, dim);
                     mtp_head::mtp_head_forward_block_only(
                         gpu,
                         head,
@@ -3695,19 +3724,27 @@ where
             }
             mtp_prompt_fill_secs += t_mtp_fill.elapsed().as_secs_f64();
 
+            // Carry the chunk's last hidden (row `chunk.len()`) into row 0: it is
+            // the partner of the next chunk's first token, and the seed for the
+            // first draft cycle after the last chunk. Stream-ordered after the
+            // fill above, which still reads row 0.
+            gpu.memcpy_dtod_at_auto(
+                &prompt_hidden.buf,
+                0,
+                &prompt_hidden.buf,
+                chunk.len() * dim_bytes,
+                dim_bytes,
+            )?;
+
             // Committed boundary: trunk + MTP private KV now cover [0, committed_pos).
             on_committed_boundary(gpu, target.dn_state, committed_pos)?;
             off = end;
         }
 
         let last = prompt_tokens.len() - 1;
-        gpu.hip.memcpy_dtod_at(
-            &state.prev_hidden.buf,
-            0,
-            &prompt_hidden.buf,
-            (last + 1) * dim_bytes,
-            dim_bytes,
-        )?;
+        // Row 0 holds the last chunk's final hidden (the carry above).
+        gpu.hip
+            .memcpy_dtod_at(&state.prev_hidden.buf, 0, &prompt_hidden.buf, 0, dim_bytes)?;
         state.prev_hidden_pos = Some(start_pos + last);
         Ok(TrunkSpinePrefillTimings {
             trunk_prefill_secs,
@@ -5733,6 +5770,60 @@ mod tests {
         assert_eq!(mtp_prompt_fill_scratch_rows(385, 384), Some(384));
         assert_eq!(mtp_prompt_fill_scratch_rows(1, 256), Some(1));
         assert_eq!(mtp_prompt_fill_scratch_rows(512, 256), Some(256));
+    }
+
+    #[test]
+    fn mtp_prompt_hidden_rows_follow_the_chunk_not_the_prompt() {
+        // The AR route takes outer chunks up to the trunk ceiling, the own
+        // route up to the head rows; neither grows with the prompt.
+        for prompt_len in [1usize, 383, 384, 4096, 120_000, 158_000] {
+            let ar = mtp_prompt_hidden_chunk_rows(MtpPromptRoute::ArRoute, 384, 8192, prompt_len);
+            assert_eq!(ar, 8192.min(prompt_len));
+            let own = mtp_prompt_hidden_chunk_rows(MtpPromptRoute::Own, 384, 8192, prompt_len);
+            assert_eq!(own, 384.min(prompt_len));
+        }
+        // A zero ceiling still holds one row.
+        assert_eq!(
+            mtp_prompt_hidden_chunk_rows(MtpPromptRoute::ArRoute, 384, 0, 100),
+            1
+        );
+    }
+
+    #[test]
+    fn mtp_prompt_hidden_carry_pairs_every_token_with_the_previous_position() {
+        // Model the pairing buffer: whole-prompt rows against one-chunk rows
+        // with a carried partner. Row `r` of a chunk starting at `off` must
+        // hold the hidden of position `off + r - 1`, as row `off + r` does in
+        // the whole-prompt layout.
+        for (n, chunk_max) in [
+            (10usize, 4usize),
+            (10, 10),
+            (7, 3),
+            (4096, 512),
+            (4097, 512),
+            (1, 8),
+        ] {
+            let mut buf = vec![usize::MAX; chunk_max + 1];
+            buf[0] = usize::MAX - 1; // partner of the first token: no position
+            let mut off = 0usize;
+            while off < n {
+                let m = (n - off).min(chunk_max);
+                for (j, slot) in buf[1..=m].iter_mut().enumerate() {
+                    *slot = off + j; // trunk writes the hidden of position off + j
+                }
+                for (j, held) in buf[..m].iter().enumerate() {
+                    let whole = if off + j == 0 {
+                        usize::MAX - 1
+                    } else {
+                        off + j - 1
+                    };
+                    assert_eq!(*held, whole, "n={n} chunk={chunk_max} token={}", off + j);
+                }
+                buf[0] = buf[m]; // carry
+                off += m;
+            }
+            assert_eq!(buf[0], n - 1, "seed is the last position's hidden");
+        }
     }
 
     #[test]
