@@ -423,6 +423,16 @@ impl<'a> Emulator<'a> {
             steps,
         })
     }
+    /// Execute a gfx1100 program with gfx1151's (RDNA3.5) numerics and WMMA model. The emulator has no hardware-
+    /// qualified gfx1100 model (WMMA fragments, V_EXP/LOG/RCP/RSQ/SQRT), so gfx1100 programs are refused without this.
+    /// Only valid where emulated arms are compared with each other or with an exact CPU reference (the pre-card safety
+    /// gate), never as a claim about gfx1100 hardware ulps. Instruction decode still uses the gfx1100 tables.
+    pub fn gfx1100_as_gfx1151(mut self) -> Self {
+        if self.arch == Arch::Gfx1100 {
+            self.arch = Arch::Gfx1151;
+        }
+        self
+    }
     pub fn run_workgroup(&self, launch: &Launch, mem: &mut Memory) -> Result<()> {
         let kernel = self.kernel;
         let symbol = &kernel.symbol.0;

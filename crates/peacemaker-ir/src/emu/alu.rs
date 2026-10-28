@@ -1045,6 +1045,26 @@ fn vector(
             Class::F32,
             num_select(num_select(f(0)?, f(1)?, false), f(2)?, false),
         ),
+        // gfx11 VOP3 three-operand legacy min/max (RDNA3 ISA): `v_maxmin_f32 = min(max(S0, S1), S2)` and
+        // `v_minmax_f32 = max(min(S0, S1), S2)`, each stage the legacy compare-select of `v_max_f32`/`v_min_f32`.
+        "v_maxmin_f32" => (
+            Class::F32,
+            legacy_select(
+                arch,
+                legacy_select(arch, g(0, false)?, g(1, false)?, true)?,
+                g(2, false)?,
+                false,
+            )?,
+        ),
+        "v_minmax_f32" => (
+            Class::F32,
+            legacy_select(
+                arch,
+                legacy_select(arch, g(0, false)?, g(1, false)?, false)?,
+                g(2, false)?,
+                true,
+            )?,
+        ),
         // gfx12 three-operand min/max (RDNA4 ISA): `v_maxmin_num_f32 = min_num(max_num(S0, S1), S2)`, hardware-compared
         // with that composition over every triple of a 48-value set including zeros, denormals, infinities and
         // quiet/signalling NaNs (receipt `gfx1201-maxmin-r1`; its `v_minmax_num_f32` twin was measured the same way but

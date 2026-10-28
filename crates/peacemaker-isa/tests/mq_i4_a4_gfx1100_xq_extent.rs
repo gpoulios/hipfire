@@ -50,10 +50,22 @@ fn cases() -> Vec<Case> {
     assert_eq!(4 * L + 152_665, FIRST_BAD_INDEX + 0);
     vec![
         Case { row: 0, slot: 7 },
-        Case { row: 5, slot: 152_664 },
-        Case { row: 320, slot: 152_665 },
-        Case { row: 321, slot: 160_000 },
-        Case { row: P - 1, slot: L - 1 },
+        Case {
+            row: 5,
+            slot: 152_664,
+        },
+        Case {
+            row: 320,
+            slot: 152_665,
+        },
+        Case {
+            row: 321,
+            slot: 160_000,
+        },
+        Case {
+            row: P - 1,
+            slot: L - 1,
+        },
     ]
 }
 
@@ -117,10 +129,15 @@ fn run(program: &peacemaker_ir::Program, sorted: &[i32], h: &[u16]) -> Result<Me
     karg.extend((P as u32).to_le_bytes());
     karg.extend((L as u32).to_le_bytes());
     karg.resize(k3::KERNARG_BYTES as usize, 0);
-    let f = |s: &[f32; 128]| -> Vec<u8> { s.iter().flat_map(|x| x.to_bits().to_le_bytes()).collect() };
+    let f =
+        |s: &[f32; 128]| -> Vec<u8> { s.iter().flat_map(|x| x.to_bits().to_le_bytes()).collect() };
     let mut mem = Memory::default();
     mem.map("karg".into(), KARG, karg)?;
-    mem.map("h".into(), H, h.iter().flat_map(|x| x.to_le_bytes()).collect())?;
+    mem.map(
+        "h".into(),
+        H,
+        h.iter().flat_map(|x| x.to_le_bytes()).collect(),
+    )?;
     mem.map(
         "sorted".into(),
         SORTED,
@@ -152,14 +169,34 @@ fn xq_records_land_at_g_l_plus_slot_across_the_828505_threshold() {
     let (sorted, h) = problem();
     let mem = run(&program(false), &sorted, &h).expect("fixed K3 runs the real-window workgroups");
     let (s1, s2) = (signs(43), signs(1043));
-    let written = mem.regions.iter().find(|r| r.name == "xq").unwrap().written.count();
-    assert_eq!(written, cases().len() * 5 * REC, "exactly the 5 records of each row, nothing else");
+    let written = mem
+        .regions
+        .iter()
+        .find(|r| r.name == "xq")
+        .unwrap()
+        .written
+        .count();
+    assert_eq!(
+        written,
+        cases().len() * 5 * REC,
+        "exactly the 5 records of each row, nothing else"
+    );
     for c in cases() {
         for g in 0..5 {
             let index = g * L + c.slot;
             let got = mem.read(XQ + (index * REC) as u64, REC).unwrap();
-            let want = record(&h[c.row * 640 + g * 128..c.row * 640 + (g + 1) * 128], &s1, &s2);
-            assert_eq!(got, &want[..], "row {} slot {} g {g}: record index {index}", c.row, c.slot);
+            let want = record(
+                &h[c.row * 640 + g * 128..c.row * 640 + (g + 1) * 128],
+                &s1,
+                &s2,
+            );
+            assert_eq!(
+                got,
+                &want[..],
+                "row {} slot {} g {g}: record index {index}",
+                c.row,
+                c.slot
+            );
         }
     }
 }
@@ -173,4 +210,25 @@ fn the_original_instruction_order_stores_4_gib_away() {
         err.contains("p 320, g 4") && err.contains("unmapped memory access"),
         "{err}"
     );
+}
+
+/// The committed product object `kernels/mq_i4_a4_pm_gfx1100.hxaco` is what the builder emits today (fresh module
+/// emission, native assembly and bundling are byte-equal to it), and it follows the gfx1100
+/// `FeatureUserSGPRInit16Bug` rule: 15 declared user SGPRs (kernarg pointer padded) + the workgroup id x = 16, the
+/// workgroup id being `s15` and the kernarg block `s[48:55]`.
+#[test]
+fn committed_bundle_equals_fresh_emission_and_declares_sixteen_user_and_system_sgprs() {
+    let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../../kernels");
+    let committed = std::fs::read(format!("{root}/mq_i4_a4_pm_gfx1100.hxaco")).unwrap();
+    let (_, text, _) = k3::emit_module(ARCH).unwrap();
+    let elf = native::assemble(&text, ARCH).unwrap();
+    let fresh = native::bundle(&elf, ARCH, native::DEFAULT_HOST_TARGET);
+    assert!(
+        fresh == committed,
+        "fresh bundle differs from the committed bundle"
+    );
+    assert!(text.contains("\t.amdhsa_user_sgpr_count 15\n"));
+    assert!(text.contains("\ts_mov_b32 s20, s15\n"));
+    assert!(text.contains("\ts_load_b256 s[48:55], s[0:1], null\n"));
+    assert!(!text.contains("s[8:15]"));
 }
