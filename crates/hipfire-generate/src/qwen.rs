@@ -4479,6 +4479,7 @@ pub fn generate_spec(
     // sampled with the Leviathan verify and neutral penalties); every other
     // speculative request is refused before any state mutation.
     let pp_mesh = m.qwen4().is_some_and(|bundle| bundle.pp_mesh_active());
+    let qwen4_target = m.qwen4().is_some();
     if pp_mesh {
         let native = m
             .speculator
@@ -4544,6 +4545,9 @@ pub fn generate_spec(
     // present exactly when the request runs on the pipeline-parallel mesh.
     let mut pp: Option<&mut hipfire_runtime::multi_gpu::Gpus> =
         if pp_mesh { m.pp_gpus.as_mut() } else { None };
+    // A client cancel keeps the session only on the configuration that was validated for it:
+    // single-GPU native MTP on the Qwen3.5-class target. Everything else keeps the full reset.
+    let keep_session_on_cancel = pp.is_none() && !qwen4_target && spec.name() == "mtp";
 
     // Divergent-render RESUME: restore the drafter-local + target recurrent
     // state to the latest checkpoint ≤ ckpt and drop the now-stale tail of the
@@ -5115,18 +5119,39 @@ pub fn generate_spec(
         // mid-decode leaves the spec-decode loop running for max_tokens
         // worth of wasted work.
         if check_abort(id) {
-            // Mid-decode cancel: reset+sync first; terminal follows attestation.
-            let ep = spec_rollback_live(
-                &mut m.seq_pos,
-                &mut m.conversation_tokens,
-                &mut m.prefill_checkpoints,
-                &mut m.dflash_checkpoints,
-                &mut m.asst_turn_cache,
-                gpu,
-                pp.as_deref_mut(),
-                slot,
-                spec.as_mut(),
-            );
+            // Mid-decode cancel. A client cancel is not a failure: at this committed cycle
+            // boundary the target KV and recurrent state describe exactly `prompt + the fed
+            // part of emitted`, so keep the session (KV, DeltaNet state, checkpoint rings,
+            // assistant-turn cache). The next request then hits, or resumes from the latest
+            // checkpoint at or before its divergence, instead of cold-prefilling the whole
+            // conversation. Sync first so the terminal still follows an attested device state;
+            // fall back to the full reset when the host cursors cannot describe the state or the
+            // configuration is not the validated one (`keep_session_on_cancel`).
+            let fed = position
+                .checked_sub(prompt_tokens.len())
+                .filter(|&fed| keep_session_on_cancel && fed <= emitted.len());
+            let ep = match fed {
+                Some(fed) => {
+                    m.seq_pos = position;
+                    m.conversation_tokens = prompt_tokens
+                        .iter()
+                        .chain(&emitted[..fed])
+                        .copied()
+                        .collect();
+                    fail_closed_epilogue_after_sync(Ok(()), fail_closed_device_sync(gpu))
+                }
+                None => spec_rollback_live(
+                    &mut m.seq_pos,
+                    &mut m.conversation_tokens,
+                    &mut m.prefill_checkpoints,
+                    &mut m.dflash_checkpoints,
+                    &mut m.asst_turn_cache,
+                    gpu,
+                    pp.as_deref_mut(),
+                    slot,
+                    spec.as_mut(),
+                ),
+            };
             emit_spec_cancel_after_rollback(stdout, id, generated, &ep);
             return None;
         }
